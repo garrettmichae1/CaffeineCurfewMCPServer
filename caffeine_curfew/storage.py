@@ -39,16 +39,19 @@ def init_db() -> None:
                 logged_at   TEXT    NOT NULL
             )
         """)
-        conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_entries_user_consumed
-            ON entries (user_id, consumed_at)
-        """)
 
         existing_columns = [
             row[1] for row in conn.execute("PRAGMA table_info(entries)")
         ]
         if "user_id" not in existing_columns:
-            conn.execute("ALTER TABLE entries ADD COLUMN user_id TEXT NOT NULL DEFAULT 'default'")
+            conn.execute(
+                "ALTER TABLE entries ADD COLUMN user_id TEXT NOT NULL DEFAULT 'default'"
+            )
+
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_entries_user_consumed
+            ON entries (user_id, consumed_at)
+        """)
 
 
 def insert_entry(
