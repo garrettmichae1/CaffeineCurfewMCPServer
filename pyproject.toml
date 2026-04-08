@@ -1,0 +1,21 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "caffeine-curfew-mcp"
+version = "0.1.0"
+description = "MCP server for tracking caffeine decay and predicting safe bedtimes"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+keywords = ["mcp", "caffeine", "sleep", "health", "claude"]
+dependencies = [
+    "mcp[cli]>=1.0.0",
+]
+
+[project.scripts]
+caffeine-curfew-mcp = "caffeine_curfew.server:main"
+
+[project.urls]
+Repository = "https://github.com/YOUR_USERNAME/caffeine-curfew-mcp"
