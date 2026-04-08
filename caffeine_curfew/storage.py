@@ -3,6 +3,10 @@ Persistent storage for caffeine entries using SQLite.
 
 The database is stored at ~/.caffeine_curfew/entries.db so it survives
 server restarts and is isolated per user account on the host machine.
+
+All operations are scoped by user_id so multiple users can share one
+server instance without their data mixing. The user_id is derived from
+the key query parameter in the SSE connection URL.
 """
 
 import sqlite3
@@ -28,27 +32,40 @@ def init_db() -> None:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS entries (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id     TEXT    NOT NULL DEFAULT 'default',
                 amount_mg   REAL    NOT NULL,
                 consumed_at TEXT    NOT NULL,
                 drink_name  TEXT,
                 logged_at   TEXT    NOT NULL
             )
         """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_entries_user_consumed
+            ON entries (user_id, consumed_at)
+        """)
+
+        existing_columns = [
+            row[1] for row in conn.execute("PRAGMA table_info(entries)")
+        ]
+        if "user_id" not in existing_columns:
+            conn.execute("ALTER TABLE entries ADD COLUMN user_id TEXT NOT NULL DEFAULT 'default'")
 
 
 def insert_entry(
     amount_mg: float,
     consumed_at: datetime,
+    user_id: str = "default",
     drink_name: str = "",
 ) -> int:
     """Insert a new entry and return its assigned id."""
     with _connect() as conn:
         cursor = conn.execute(
             """
-            INSERT INTO entries (amount_mg, consumed_at, drink_name, logged_at)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO entries (user_id, amount_mg, consumed_at, drink_name, logged_at)
+            VALUES (?, ?, ?, ?, ?)
             """,
             (
+                user_id,
                 amount_mg,
                 consumed_at.isoformat(),
                 drink_name or None,
@@ -58,32 +75,45 @@ def insert_entry(
         return cursor.lastrowid
 
 
-def fetch_entries_since(since: datetime) -> list[dict[str, Any]]:
-    """Return all entries with consumed_at >= since, oldest first."""
+def fetch_entries_since(
+    since: datetime,
+    user_id: str = "default",
+) -> list[dict[str, Any]]:
+    """Return all entries for user_id with consumed_at >= since, oldest first."""
     with _connect() as conn:
         rows = conn.execute(
             """
-            SELECT id, amount_mg, consumed_at, drink_name, logged_at
+            SELECT id, user_id, amount_mg, consumed_at, drink_name, logged_at
             FROM entries
-            WHERE consumed_at >= ?
+            WHERE user_id = ? AND consumed_at >= ?
             ORDER BY consumed_at ASC
             """,
-            (since.isoformat(),),
+            (user_id, since.isoformat()),
         ).fetchall()
     return [dict(row) for row in rows]
 
 
-def fetch_entry_by_id(entry_id: int) -> dict[str, Any] | None:
-    """Return a single entry by id, or None if not found."""
+def fetch_entry_by_id(
+    entry_id: int,
+    user_id: str = "default",
+) -> dict[str, Any] | None:
+    """Return a single entry by id scoped to user_id, or None if not found."""
     with _connect() as conn:
         row = conn.execute(
-            "SELECT * FROM entries WHERE id = ?", (entry_id,)
+            "SELECT * FROM entries WHERE id = ? AND user_id = ?",
+            (entry_id, user_id),
         ).fetchone()
     return dict(row) if row else None
 
 
-def remove_entry(entry_id: int) -> bool:
-    """Delete an entry by id. Returns True if a row was deleted."""
+def remove_entry(
+    entry_id: int,
+    user_id: str = "default",
+) -> bool:
+    """Delete an entry by id scoped to user_id. Returns True if a row was deleted."""
     with _connect() as conn:
-        cursor = conn.execute("DELETE FROM entries WHERE id = ?", (entry_id,))
+        cursor = conn.execute(
+            "DELETE FROM entries WHERE id = ? AND user_id = ?",
+            (entry_id, user_id),
+        )
         return cursor.rowcount > 0

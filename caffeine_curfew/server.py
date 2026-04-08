@@ -5,15 +5,16 @@ Exposes tools for tracking caffeine decay and predicting safe bedtimes.
 All caffeine levels are calculated using the standard half-life decay formula:
     remaining = initial * (0.5 ^ (hours_elapsed / half_life))
 
-Entries are persisted in a local SQLite database so users do not need to
-pass their history on every call. The four core tools accept an optional
-entries list for backward compatibility; when omitted they pull from storage
-automatically.
+Entries are persisted in a local SQLite database and scoped per user.
+User identity is derived automatically from the key query parameter in the
+SSE connection URL (e.g. /sse?key=abc123). No login is required.
 """
 
 from collections import defaultdict
+from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone
 from typing import Any
+from urllib.parse import parse_qs, urlparse
 
 from mcp.server.fastmcp import FastMCP
 
@@ -42,6 +43,44 @@ init_db()
 
 
 # ---------------------------------------------------------------------------
+# Per-request user context
+# ---------------------------------------------------------------------------
+
+current_user_id: ContextVar[str] = ContextVar("current_user_id", default="default")
+
+
+class UserContextMiddleware:
+    """
+    ASGI middleware that reads the key query parameter from the SSE connection
+    URL and stores it as the current user identity for the duration of the
+    request. Tools call current_user_id.get() to retrieve it.
+
+    If no key is provided, the user identity falls back to 'default'.
+    """
+
+    def __init__(self, app: Any) -> None:
+        self.app = app
+
+    async def __call__(
+        self,
+        scope: dict[str, Any],
+        receive: Any,
+        send: Any,
+    ) -> None:
+        if scope["type"] in ("http", "websocket"):
+            query_string = scope.get("query_string", b"").decode()
+            params = parse_qs(query_string)
+            key = params.get("key", ["default"])[0].strip() or "default"
+            token = current_user_id.set(key)
+            try:
+                await self.app(scope, receive, send)
+            finally:
+                current_user_id.reset(token)
+        else:
+            await self.app(scope, receive, send)
+
+
+# ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
 
@@ -59,19 +98,20 @@ def _parse_timestamp(ts: str) -> datetime:
 def _resolve_entries(
     entries: list[dict[str, Any]] | None,
     half_life_hours: float,
+    user_id: str,
 ) -> list[dict[str, Any]]:
     """
     Return entries to use for a calculation.
 
     If the caller passed an explicit list, use it as-is.
-    Otherwise pull from storage for a window of 10 half-lives, which reduces
-    any realistic dose to a negligible fraction before the window opens.
+    Otherwise pull from storage for a window of 10 half-lives for this user,
+    which reduces any realistic dose to a negligible fraction.
     """
     if entries:
         return entries
     window_hours = half_life_hours * 10
     since = datetime.now(timezone.utc) - timedelta(hours=window_hours)
-    return fetch_entries_since(since)
+    return fetch_entries_since(since, user_id=user_id)
 
 
 def _caffeine_at_time(
@@ -154,7 +194,7 @@ def _date_key(ts: str) -> str:
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def log_entry(
+async def log_entry(
     amount_mg: float,
     drink_name: str = "",
     consumed_at: str = "",
@@ -173,6 +213,8 @@ def log_entry(
         drink_name   str    the label that was saved
         consumed_at  str    the timestamp that was saved (UTC ISO 8601)
     """
+    user_id = current_user_id.get()
+
     if consumed_at:
         dt = _parse_timestamp(consumed_at)
     else:
@@ -181,6 +223,7 @@ def log_entry(
     entry_id = insert_entry(
         amount_mg=amount_mg,
         consumed_at=dt,
+        user_id=user_id,
         drink_name=drink_name,
     )
 
@@ -193,7 +236,7 @@ def log_entry(
 
 
 @mcp.tool()
-def list_entries(days: int = 1) -> dict[str, Any]:
+async def list_entries(days: int = 1) -> dict[str, Any]:
     """
     List stored entries from the past N days.
 
@@ -205,8 +248,9 @@ def list_entries(days: int = 1) -> dict[str, Any]:
         count    int   total number of entries returned
         since    str   the start of the window in local time
     """
+    user_id = current_user_id.get()
     since = datetime.now(timezone.utc) - timedelta(days=days)
-    rows = fetch_entries_since(since)
+    rows = fetch_entries_since(since, user_id=user_id)
 
     return {
         "entries": rows,
@@ -216,7 +260,7 @@ def list_entries(days: int = 1) -> dict[str, Any]:
 
 
 @mcp.tool()
-def delete_entry(entry_id: int) -> dict[str, Any]:
+async def delete_entry(entry_id: int) -> dict[str, Any]:
     """
     Delete a stored entry by its id.
 
@@ -229,7 +273,8 @@ def delete_entry(entry_id: int) -> dict[str, Any]:
         deleted   bool  True if the entry was found and deleted
         entry_id  int   the id that was targeted
     """
-    deleted = remove_entry(entry_id)
+    user_id = current_user_id.get()
+    deleted = remove_entry(entry_id, user_id=user_id)
     return {
         "deleted": deleted,
         "entry_id": entry_id,
@@ -241,7 +286,7 @@ def delete_entry(entry_id: int) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def get_insights(
+async def get_insights(
     days: int = 7,
     half_life_hours: float = 5.0,
     threshold_mg: float = 25.0,
@@ -266,15 +311,15 @@ def get_insights(
         peak_day              dict   {date, total_mg} for the highest-intake day
         days_above_threshold  int    days where caffeine exceeded threshold at bedtime
         most_common_hour      int    hour of day (0-23) when drinks are most often logged
-        trend                 str    "increasing", "decreasing", or "stable" based on
-                                     comparing the first half of the period to the second
-        days_with_entries     int    number of distinct days that have at least one entry
+        trend                 str    "increasing", "decreasing", or "stable"
+        days_with_entries     int    number of distinct days with at least one entry
     """
+    user_id = current_user_id.get()
     half_life_hours = _clamp_half_life(half_life_hours)
     threshold_mg = _clamp_threshold(threshold_mg)
 
     since = datetime.now(timezone.utc) - timedelta(days=days)
-    entries = fetch_entries_since(since)
+    entries = fetch_entries_since(since, user_id=user_id)
 
     if not entries:
         return {
@@ -351,11 +396,11 @@ def get_insights(
 
 
 # ---------------------------------------------------------------------------
-# Core caffeine tools (entries param now optional; pulls from storage if omitted)
+# Core caffeine tools (entries param optional; pulls from storage if omitted)
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def get_caffeine_level(
+async def get_caffeine_level(
     entries: list[dict[str, Any]] | None = None,
     half_life_hours: float = 5.0,
 ) -> dict[str, Any]:
@@ -375,8 +420,9 @@ def get_caffeine_level(
         calculated_at     str    the UTC timestamp of the calculation
         source            str    "provided" if entries were passed, "storage" if loaded
     """
+    user_id = current_user_id.get()
     half_life_hours = _clamp_half_life(half_life_hours)
-    resolved = _resolve_entries(entries, half_life_hours)
+    resolved = _resolve_entries(entries, half_life_hours, user_id)
     now = datetime.now(timezone.utc)
     level = _caffeine_at_time(resolved, half_life_hours, now)
 
@@ -389,7 +435,7 @@ def get_caffeine_level(
 
 
 @mcp.tool()
-def get_safe_bedtime(
+async def get_safe_bedtime(
     entries: list[dict[str, Any]] | None = None,
     half_life_hours: float = 5.0,
     threshold_mg: float = 25.0,
@@ -411,9 +457,10 @@ def get_safe_bedtime(
         threshold_mg       float  the threshold used
         source             str    "provided" or "storage"
     """
+    user_id = current_user_id.get()
     half_life_hours = _clamp_half_life(half_life_hours)
     threshold_mg = _clamp_threshold(threshold_mg)
-    resolved = _resolve_entries(entries, half_life_hours)
+    resolved = _resolve_entries(entries, half_life_hours, user_id)
 
     now = datetime.now(timezone.utc)
     current_level = _caffeine_at_time(resolved, half_life_hours, now)
@@ -431,7 +478,7 @@ def get_safe_bedtime(
 
 
 @mcp.tool()
-def simulate_drink(
+async def simulate_drink(
     new_drink_mg: float,
     entries: list[dict[str, Any]] | None = None,
     half_life_hours: float = 5.0,
@@ -458,9 +505,10 @@ def simulate_drink(
         new_drink_mg          float  the drink amount that was simulated
         source                str    "provided" or "storage"
     """
+    user_id = current_user_id.get()
     half_life_hours = _clamp_half_life(half_life_hours)
     threshold_mg = _clamp_threshold(threshold_mg)
-    resolved = _resolve_entries(entries, half_life_hours)
+    resolved = _resolve_entries(entries, half_life_hours, user_id)
 
     now = datetime.now(timezone.utc)
 
@@ -490,7 +538,7 @@ def simulate_drink(
 
 
 @mcp.tool()
-def get_status_summary(
+async def get_status_summary(
     entries: list[dict[str, Any]] | None = None,
     half_life_hours: float = 5.0,
     threshold_mg: float = 25.0,
@@ -523,9 +571,10 @@ def get_status_summary(
         threshold_mg             float  the threshold used
         source                   str    "provided" or "storage"
     """
+    user_id = current_user_id.get()
     half_life_hours = _clamp_half_life(half_life_hours)
     threshold_mg = _clamp_threshold(threshold_mg)
-    resolved = _resolve_entries(entries, half_life_hours)
+    resolved = _resolve_entries(entries, half_life_hours, user_id)
 
     now = datetime.now(timezone.utc)
     current_level = _caffeine_at_time(resolved, half_life_hours, now)
@@ -563,14 +612,15 @@ def main() -> None:
     Console script entry point used by uvx and pip installs.
 
     Flags:
-        --transport  stdio (default) or sse
-        --host       host to bind when using SSE transport (default 0.0.0.0)
-        --port       port to bind when using SSE transport (default 8000)
+        --transport    stdio (default) or sse
+        --host         host to bind when using SSE transport (default 0.0.0.0)
+        --port         port to bind when using SSE transport (default 8000)
+        --allowed-host external hostname to allow through DNS rebinding protection
 
     Examples:
-        caffeine-curfew-mcp                           stdio for Claude Code
-        caffeine-curfew-mcp --transport sse           SSE on 0.0.0.0:8000
-        caffeine-curfew-mcp --transport sse --port 9000
+        caffeine-curfew-mcp                                         stdio for Claude Code
+        caffeine-curfew-mcp --transport sse                         SSE on 0.0.0.0:8000
+        caffeine-curfew-mcp --transport sse --allowed-host caffeine.example.com
     """
     import argparse
 
@@ -595,15 +645,13 @@ def main() -> None:
     parser.add_argument(
         "--allowed-host",
         default="",
-        help="External hostname to allow through DNS rebinding protection (e.g. caffeine.getgeorgeapp.com)",
+        help="External hostname to allow through DNS rebinding protection",
     )
     args = parser.parse_args()
 
     if args.transport == "sse":
+        import uvicorn
         from mcp.server.transport_security import TransportSecuritySettings
-
-        mcp.settings.host = args.host
-        mcp.settings.port = args.port
 
         allowed_hosts = ["127.0.0.1:*", "localhost:*", "[::1]:*"]
         allowed_origins = [
@@ -616,13 +664,16 @@ def main() -> None:
             allowed_hosts.append(args.allowed_host)
             allowed_origins.append(f"https://{args.allowed_host}")
 
+        mcp.settings.host = args.host
+        mcp.settings.port = args.port
         mcp.settings.transport_security = TransportSecuritySettings(
             enable_dns_rebinding_protection=True,
             allowed_hosts=allowed_hosts,
             allowed_origins=allowed_origins,
         )
 
-        mcp.run(transport="sse")
+        app = UserContextMiddleware(mcp.sse_app())
+        uvicorn.run(app, host=args.host, port=args.port)
     else:
         mcp.run(transport="stdio")
 
