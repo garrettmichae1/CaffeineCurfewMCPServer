@@ -19,3 +19,6 @@ caffeine-curfew-mcp = "caffeine_curfew.server:main"
 
 [project.urls]
 Repository = "https://github.com/YOUR_USERNAME/caffeine-curfew-mcp"
+
+[tool.hatch.build.targets.wheel]
+packages = ["caffeine_curfew"]
