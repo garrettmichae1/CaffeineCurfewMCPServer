@@ -592,11 +592,36 @@ def main() -> None:
         default=8000,
         help="Port to bind when using SSE transport (default: 8000)",
     )
+    parser.add_argument(
+        "--allowed-host",
+        default="",
+        help="External hostname to allow through DNS rebinding protection (e.g. caffeine.getgeorgeapp.com)",
+    )
     args = parser.parse_args()
 
     if args.transport == "sse":
+        from mcp.server.transport_security import TransportSecuritySettings
+
         mcp.settings.host = args.host
         mcp.settings.port = args.port
+
+        allowed_hosts = ["127.0.0.1:*", "localhost:*", "[::1]:*"]
+        allowed_origins = [
+            "http://127.0.0.1:*",
+            "http://localhost:*",
+            "http://[::1]:*",
+        ]
+
+        if args.allowed_host:
+            allowed_hosts.append(args.allowed_host)
+            allowed_origins.append(f"https://{args.allowed_host}")
+
+        mcp.settings.transport_security = TransportSecuritySettings(
+            enable_dns_rebinding_protection=True,
+            allowed_hosts=allowed_hosts,
+            allowed_origins=allowed_origins,
+        )
+
         mcp.run(transport="sse")
     else:
         mcp.run(transport="stdio")
